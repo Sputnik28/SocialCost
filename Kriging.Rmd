@@ -1,0 +1,381 @@
+---
+title: "R로 크리깅하기"
+output: html_notebook
+---
+
+# 대기오염 농도 데이터 가공
+
+## 패키지 설치
+`dplyr`
+`data.table`은 읽고 쓰는 속도를 빠르게 하는 함수를 제공한다. `fread`가 이 패키지에 포함되어 있다.
+`parallel`은 `lapply`와 비슷한 `mclapply`를 제공하는 패키지로, 기능이 동일하지만 멀티코어 개수를 지정할 수 있다는 차이점이 있다.
+블로그(http://randpython.blogspot.com/2018/01/r.html) 글을 참조하여 여러개의 패키지를 한번에 설치하는 사용자정의 함수를 사용한다.
+
+```{r}
+ipak <- function(pkg){
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+  if (length(new.pkg))
+    install.packages(new.pkg, dependencies = TRUE)
+  sapply(pkg, require, character.only = TRUE)
+}
+
+pkg <- c("dplyr", "data.table", "parallel", "readxl")
+ipak(pkg)
+
+lapply(pkg, require, character.only = TRUE)
+
+```
+
+## 데이터 다운로드
+측정소별 대기오염 농도 데이터는 한국환경공단 에어코리아 - 통계정보 - 최종확정측정자료조회 -확정자료다운로드 메뉴에서 다운로드 받는다. 측정망은 도시대기, 도로변대기, 교외대기, 국가배경, 항만으로 구분되는데 모든 측정망 데이터를 공간보간에 넣을 것인지 선택해야 한다. 연구자에 따라 도시대기측정망과 도로변대기 측정망을 사용하거나, 도시대기측정망만 사용하는 등의 차이가 있다.
+
+일단 여기서는 측정망을 선별하지 않고 모두 분석에 활용한다고 전제한다.
+
+## 데이터 읽어들이기
+여러 해의 농도 데이터를 읽어 들여야 하므로 하나씩 읽어들이는 대신에 농도 데이터가 들어가 있는 폴더를 통째로 읽어들인다.
+`lapply`를 이용해서 폴더 내에 들어간 데이터를 일괄 읽어들이는 방식으로 코드를 짰다. 
+
+농도 데이터는 연단위로 csv 또는 xlsx 파일 형태로 구성되어 있다.
+csv를 읽는 기본함수는 `read.csv`이지만 느리기 때문에 `data.table`패키지에 있는 `fread`를 이용하여 파일을 읽어들였다.
+파일명에 공백이 있을 경우 `fread`로 파일명을 바로 입력하면 문제 없이 읽히지만 `lapply`에 파일명을 넣는 방식으로 읽으면 공백을 인식하지 못하고 에러를 낸다.
+따라서 파일명에 공백이 없도록 해야 한다.
+
+```
+Taking input= as a system command ('2014년 1분기.csv') and a variable has been used in the expression passed to `input=`. Please use fread(cmd=...). There is a security concern if you are creating an app, and the app could have a malicious user, and the app is not running in a secure environment; e.g. the app is running as root. Please read item 5 in the NEWS file for v1.11.6 for more information and for the option to suppress this message.
+```
+```{r}
+dir <- "data"
+
+CSVfile = list.files(path=dir, pattern="*.csv")
+AllCSV <- lapply(CSVfile,function(i){ data.table::fread(paste0(dir,"/",i)) })
+```
+
+엑셀파일은 `readxl`과 `xlsx` 패키지로 읽을 수 있는데 `xlsx`는 엑셀을 빠르게 읽는다는 함수 `read.xlsx2`가 있다.
+그런데 자바에러가 발생해서 `readxl`를 사용한다.
+참고로 `data.table`에 있는 `fread`로 `xlsx`도 파일을 읽을 수 있다는데, 읽어보니 인코딩문제 때문인지 안 읽힌다.
+`read_xl`은 `tibble`형식이라 `data.frame`으로변환하는 것이 나중에 한번에 다루기 좋다.
+파일 개수가 많아서 오래걸리니 유의할 것
+```{r}
+Xlsxfile = list.files(path=dir, pattern="*.xlsx")
+AllXlsx <- lapply(Xlsxfile,function(i){as.data.frame(read_excel(paste0(dir,"/",i))) })
+```
+
+## 시간 데이터 형식 정의
+농도 데이터에서 `측정일시` 컬럼을 날짜 정보로 지정하기 위해 `as.POSIXct`을 사용한다.
+`list`의 `element`가 `data.frame`이므로 각 `df`의 특정 컬럼의 형식을 `as.POSIXct`으로 일괄 변환하기 위해`lapply`함수를 적용했다.
+
+데이터를 가볍게 하기 위해 측정망의 유형에 따라 컬럼의 수가 다름에 따라 필요한 컬럼만 추출
+ -> 측정소 코드, 측정일시, SO2, O3, CO, NO2, PM10, PM25 
+
+생성연도에 따라 PM2.5가 없거나 망 종류에 대한 구분이 없어서 열 개수가 다르다.
+
+단, `data.frame`인 경우 []를 이용한 필터링 방법이 적용되지 않아 에러가 난다.
+`setDT()`를 이용해서 `data.table`로 변환해야 한다.
+
+```{r}
+All <- append(AllXlsx, AllCSV)
+save(All, file = "All.rdata")
+All1 <- lapply(All, function(df) {
+             if(ncol(df) == 10) {
+                  colnames(df)[3] <- "code"
+                  colnames(df)[4] <- "time"
+                  df <- df %>% select(matches("code|time|SO2|O3|CO|NO2|PM10|PM25"))
+                  df$time <- as.POSIXct(as.character(df$time), format="%Y%m%d%H")
+             } else if (ncol(df) == 11) {
+                  colnames(df)[2] <- "code"
+                  colnames(df)[4] <- "time"
+                  df <- df %>% select(matches("code|time|SO2|O3|CO|NO2|PM10|PM25"))
+                  df$time <- as.POSIXct(as.character(df$time), format="%Y%m%d%H")
+             } else if (ncol(df) == 12) {
+                  colnames(df)[3] <- "code"
+                  colnames(df)[5] <- "time"
+                  df <- df %>% select(matches("code|time|SO2|O3|CO|NO2|PM10|PM25"))
+                  df$time <- as.POSIXct(as.character(df$time), format="%Y%m%d%H")
+             } else break
+         return(df)})
+rm(All)
+save(All1, file = "All1.rdata")
+All2 <- rbindlist(All1, fill = TRUE)
+save(All2, file = "All2.rdata")
+```
+
+### 매 시간 단위로 파일 분할하기(농도주의보 분석 시)
+대기오염 수준을 나타내는 지표로 (그냥 농도가 아닌) 대기오염 주의보 발령 빈도를 설정하는 경우, 매 시간 단위의 농도값이 필요하므로, 매 시간 단위의 농도값 공간분포를 보간하여야 한다. 각 시점 간에는 영향을 미치지 않고 동일 시점 서로 다른 공간 위치의 값을 이용하여 보간을 하는 것이므로 공간보간분석의 편의를 위해 시간별 데이터가 모두 합쳐져 있는 에어코리아 데이터를 매 시간 단위로 분할시켜주는게 좋다. 그래야 순차적으로 공간보간을 하다가 오류가 발생해도 그 이전시간까지의 크리깅 결과는 확보되므로.
+
+시간단위로 데이터를 분할하기 위해서는 `split`함수를 사용하면 되는데 이 함수는 시간변수를 인식해서 시간별로 데이터를 나눠준다.
+
+그다음 각각 데이터에서 농도 데이터를 한 시간 단위로 분할하고 CSV로 저장했다.
+
+```{r}
+a <- split(df, cut(df$측정일시, breaks = "hour"))
+
+lapply(seq_along(a), function(i){
+    write.csv(a[[i]], paste0("pm", i, ".csv"), row.names = FALSE)
+  })
+```
+
+## 일 평균 농도 데이터 파일 만들기
+각 측정소별 매 시간 농도가 아닌, 일 평균 농도값을 구한다. 월평균, 연평균도 일평균의 평균이므로 우선 일 평균값이 필요하다.
+식이 꽤 복잡한데, 일단 농도값이 들어가 있는 열의 데이터가 수치형으로 되어 있지 않아서 `transform`을 이용하여 변환해주었다.
+다음으로 매시별 농도를 일단위로 평균하기 위해 시간정보를 삭제하고 날짜 정보만 남겼다. 여기서 `tz`는 시간대를 지정하는 것인데 이걸 입력하지 않으면 왜인지 아침8시까지는 전날로 간주된다. `tz`정보를 `KST`로 입력하는 것은 먹히지 않기 때문에 `Asia/Seoul`이라고 입력해주어야 한다.
+
+측정기기 고장으로 값이 제대로 측정되지 않은 경우에는 `-999`로 입력되어 있기 때문에 `NA`로 일괄 변환했다.
+이렇게 결측치가 많은 값은 평균을 왜곡할 우려가 있으므로 하루 24시간 중 2/3이상이 결측치 인 경우 (16시간 이상) 해당 측정소는 일 평균값이 `NA`인 것으로 처리했다.
+
+6개 오염물질별로 데이터를 가공해야하기 때문에 여기서 `across` 함수가 없다면 코드가 **아래와 같이 굉장히 지저분해진다.**
+
+```{r}
+load("All2.rdata") # dirty example
+
+daily <- All2 %>%
+            transform(SO2 = as.numeric(SO2), CO = as.numeric(CO), O3 = as.numeric(O3), NO2 = as.numeric(NO2), PM10 = as.numeric(PM10), PM25 = as.numeric(PM25)) %>%
+            mutate(time = as.Date(time,  tz='Asia/Seoul', format = "%Y-%m-%d"),  SO2 = na_if(SO2, -999),  CO = na_if(CO, -999),  O3 = na_if(O3, -999),  NO2 = na_if(NO2, -999), PM10 = na_if(PM10, -999), PM25 = na_if(PM25, -999)) %>%
+            group_by(code, time) %>% summarize(SO2 = mean(SO2[sum(!is.na(SO2)) >= 18], na.rm=TRUE), CO = mean(CO[sum(!is.na(CO)) >= 18], na.rm=TRUE), O3 = mean(O3[sum(!is.na(O3)) >= 18], na.rm=TRUE), NO2 = mean(NO2[sum(!is.na(NO2)) >= 18], na.rm=TRUE), PM10 = mean(PM10[sum(!is.na(PM10)) >= 18], na.rm=TRUE), PM25 = mean(PM25[sum(!is.na(PM25)) >= 18], na.rm=TRUE))
+save(All3, file = "All3.rdata")
+```
+
+`across`를 적용해서 다음과 같이 단순화할 수 있다. 단, `transform` 함수는 R의 base function이라서 그런지 그대로 쓰면 에러가 난다. `mutate`를 쓸 것.
+`-999` 값을 바꾸거나, 조건에 맞추어 평균하는 등의 작업까지 단순화하지는 못했다.
+
+```{r}
+load("All2.rdata")
+daily <- All2 %>%
+             mutate(across(c(SO2, CO, O3, NO2, PM10, PM25), as.numeric)) %>%
+            mutate(time = as.Date(time,  tz='Asia/Seoul', format = "%Y-%m-%d"),  SO2 = na_if(SO2, -999),  CO = na_if(CO, -999),  O3 = na_if(O3, -999),  NO2 = na_if(NO2, -999), PM10 = na_if(PM10, -999), PM25 = na_if(PM25, -999)) %>%
+            group_by(code, time) %>% summarize(SO2 = mean(SO2[sum(!is.na(SO2)) >= 18], na.rm=TRUE), CO = mean(CO[sum(!is.na(CO)) >= 18], na.rm=TRUE), O3 = mean(O3[sum(!is.na(O3)) >= 18], na.rm=TRUE), NO2 = mean(NO2[sum(!is.na(NO2)) >= 18], na.rm=TRUE), PM10 = mean(PM10[sum(!is.na(PM10)) >= 18], na.rm=TRUE), PM25 = mean(PM25[sum(!is.na(PM25)) >= 18], na.rm=TRUE))
+save(daily, file = "daily.rdata")
+```
+
+### 월 평균 농도 데이터 파일 만들기
+이제 데이터가 많이 가벼워져서 월 평균은 금방 계산할 수 있다.
+굳이 미리 만들어둘 필요는 없을 것 같다.
+
+```{r}
+library(lubridate)
+load("daily.rdata")
+monthly <- pollution_daily %>%
+        mutate(time = floor_date(time, "month")) %>%
+        group_by(code, time) %>% summarize(SO2 = mean(SO2[sum(!is.na(SO2)) >= 20], na.rm=TRUE), CO = mean(CO[sum(!is.na(CO)) >= 20], na.rm=TRUE), O3 = mean(O3[sum(!is.na(O3)) >= 20], na.rm=TRUE), NO2 = mean(NO2[sum(!is.na(NO2)) >= 20], na.rm=TRUE), PM10 = mean(PM10[sum(!is.na(PM10)) >= 20], na.rm=TRUE), PM25 = mean(PM25[sum(!is.na(PM25)) >= 20], na.rm=TRUE))
+```
+
+### 연 평균 농도 데이터 파일 만들기
+
+말모
+
+```{r}
+library(lubridate)
+yearly <- monthly %>%
+        mutate(time = floor_date(time, "year")) %>%
+        group_by(code, time) %>% summarize(SO2 = mean(SO2[sum(!is.na(SO2)) >= 6], na.rm=TRUE), CO = mean(CO[sum(!is.na(CO)) >= 6], na.rm=TRUE), O3 = mean(O3[sum(!is.na(O3)) >= 6], na.rm=TRUE), NO2 = mean(NO2[sum(!is.na(NO2)) >= 6], na.rm=TRUE), PM10 = mean(PM10[sum(!is.na(PM10)) >= 6], na.rm=TRUE), PM25 = mean(PM25[sum(!is.na(PM25)) >= 6], na.rm=TRUE))
+```
+
+ifelse와 if_else(dplyr만 있음)의 차이는, 후자가 좀 더 엄격한데 참일 경우 반환하는 값과 거짓일 경우 반환하는 값이 동일한 데이터 형식, 즉 둘다 character거나 둘다 double이거나 이어야 한다는 점이다.
+여기서는 거짓일 때 NA를 반환할 것이므로 ifelse가 더 적합하다.
+
+```{r}
+
+All2[c(1:100),] %>% transform(SO2 = as.numeric(SO2)) %>%
+                  mutate(time = as.Date(time,  tz='Asia/Seoul', format = "%Y-%m-%d"), SO2 = na_if(SO2, -999)) %>%
+                  group_by(code, time) %>%
+                  summarize(SO2 = ifelse(first((sum(!is.na(SO2)) / n()) >= 0.75), mean(SO2, na.rm=TRUE), NA))
+                  
+```
+
+
+## 측정소 위경도 정보와 결합하기
+대기오염 농도 데이터를 불러온다. 단, `read_excel`로 불러들인 테이블은 `grouped_df`로 타입이 인식되기 때문에, `merge`를 위해서 타입변환이 필요하다.
+
+```{r}
+load("daily.rdata")
+daily <- as.data.table(daily)
+```
+
+측정소 위치정보는 대기환경연보의 부록에서 가져온다.최신의 대기환경연보 부록만 다운로드받을 경우 오래전 폐쇠된 측정소 정보는 나와있지 않다. 따라서 시계열 데이터 연도별 측정소정보를 모두 결합해야 한다. 운좋게도 이번 경우는 2011년 측정소 정보와 2020년 측정소 정보만 가지고도 분석 대상 기간의 전체 측정소 위치를 모두 매칭할 수 있었다.
+
+두 번째 난관은 측정소 중 위치를 이전한 곳들을 결합하는 것이다. 즉, 동일한 측정소 코드가 반복되어 나타난다. 이전한 측정소의 운영시작일이 일단위까지 자세히 나와있지 않기 때문에 이전 월을 기준으로 직전월 마지막 일까지 이전 측정소 위치와 연결하였다. 측정소코드별 운영기간정보는 엑셀에서 별도로 작업했다. 그 다음 과거 측정소 테이블과 이동 후 측정소 테이블을 별도의 엑셀 파일로 분리해서 각각 `merge` 했다. 하나의 테이블에 고유값(측정소 코드)이 한번씩만 나타나도록 하기 위해서.
+
+```{r}
+dir <- getwd()
+stn.prev <- read_excel(paste0(dir,"/stn.prev.xlsx"))
+stn.curr <- read_excel(paste0(dir,"/stn.curr.xlsx"))
+
+stn.prev <- as.data.table(stn.prev)
+stn.curr <- as.data.table(stn.curr)
+
+class(stn.curr$code) = "character"
+
+stn.prev$stvalid <- as.Date(as.POSIXct(stn.prev$stvalid, tz='Asia/Seoul'))
+stn.prev$endvalid <- as.Date(as.POSIXct(stn.prev$endvalid, tz='Asia/Seoul'))
+stn.curr$stvalid <- as.Date(as.POSIXct(stn.curr$stvalid, tz='Asia/Seoul'))
+stn.curr$endvalid <- as.Date(as.POSIXct(stn.curr$endvalid, tz='Asia/Seoul'))
+
+df1 <- merge(daily,stn.prev,by = "code")[time >= stvalid & time <= endvalid, list(code, time, LON, LAT, PM10, PM25, SO2, NO2, CO, O3)]
+
+df2 <- merge(daily,stn.curr,by = "code")[time >= stvalid & time <= endvalid, list(code, time, LON, LAT, PM10, PM25, SO2, NO2, CO, O3)]
+
+daily.lonlat <- rbind(df1,df2)
+```
+
+
+## 일별 데이터 분할
+
+크리깅은 매 시간 단위마다 수행되므로, 가공된 데이터를 매 시간 단위별로 분할한다. `split`을 사용하면 아웃풋이 리스트로 나오기 때문에 리스트의 각 원소별로 `write.csv`함수를 적용할 수 있도록 `lapply`를 사용한다.
+
+```{r}
+daily.splited <- split(daily.lonlat, daily$time)
+
+lapply(seq_along(daily.splited), function(i){
+    write.csv(daily.splited[[i]], paste0("daily", names(daily.splited[i]), ".csv"), row.names = FALSE)})
+
+```
+
+# 크리깅
+
+## 패키지 설치
+R의 크리깅 라이브러리는 `gstat`, `geoR`, `kriging` 등이 있다.
+`gstat`은 simple kriging, ordinary kriging, universal kriging을 제공한다.
+`geoR`은 simple kriging, ordinary kriging, external trend kriging, universal kriging을 제공한다.
+`kriging`은 ordinary kriging만 제공한다.
+
+```{r}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(gstat, geoR, kriging, sp, spacetime, raster, rgdal, rgeos, data.table, sf, dplyr)
+```
+
+여기서 하려는 공간보간은 공간 차원에서의 보간, 즉 spatial interpolation이다. 시공간 보간까지하는 spatio-temporal interpolation 방법도 있다. 하나의 시점, 여러 공간 위치에서 측정된 값으로 동일한 시점에 측정이 이루어지지 않은 공간 위치의 값을 알아내기 위한 공간보간법과 다르게, 시공간 보간법은 측정이 이루어진 공간 위치와 시점별로 측정된 값을 이용하여 임의의 공간 위치와 시점에서 값을 추정하기 위한 방법이다. 연구목적 상 시간보다 더 세분화된 데이터가 필요하지는 않으므로 시공간 보간법은 더이상 다루지 않는다. 
+
+## 공간분석 패키지
+`sp`
+`spacetime`
+`raster`
+`rgdal`
+`rgeos`
+`sf`
+
+R에서 공간객체는 st object, sp object로 구분되고 각각 패키지가 다르다고 한다. `sf`패키지는 st object를 다루기 위한 것이고 `raster` 패키지는 sp object를 다루기 위한 것이다.
+
+## 지도 읽어들이기
+
+인터넷에서 지도를 다운로드 받아서 읽어들인다.
+```{r}
+map = readOGR("TL_SCCO_SIG.shp") # as of Jan 2021 (http://www.gisdeveloper.co.kr/?p=2332)
+```
+### 좌표계 변환
+다운로드 받은 `shp`파일의 좌표계가 WGS 84가 아니기 때문에 좌표계를 변환해야 한다. 좌표계 변환법은 [다음 설명](https://datadoctorblog.com/2021/02/01/R-Preprocessing-change-crs/)을 참고했다.
+
+```{r}
+ls_crs = list(wgs84 = "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs")
+map = spTransform(map, CRSobj = CRS(ls_crs$wgs84))
+```
+
+#### 분석대상지역 필터링
+특정 지역(예. 수도권)만 분석하고자 하는 경우, 시군구 코드`SIG_CD`를 기준으로 필터링한다. 
+
+```{r}
+studyarea = subset(map, substr(map$SIG_CD,1,2) == "11" | substr(map$SIG_CD,1,2) == "26" | substr(map$SIG_CD,1,2) == "27" |
+                     substr(map$SIG_CD,1,2) == "28" | substr(map$SIG_CD,1,2) == "29" | substr(map$SIG_CD,1,2) == "30" |
+                     substr(map$SIG_CD,1,2) == "31")
+```
+
+#### 분석대상지역(폴리곤) 내에 위치한 측정소(point)만 추출
+
+```{r}
+newdf <- newdf[studyarea,] # Where, CRS of two sp objects must be identical.
+newdf <- intersect(newdf,studyarea)
+
+st_newdf <- st_as_sf(newdf)
+st_studyarea <- st_as_sf(studyarea)
+st_newdf <- st_intersection(st_newdf, st_studyarea)
+```
+
+추출 결과 확인하기
+
+```{r}
+plot(studyarea, col = "lightgrey")
+points(df, pch=4, cex = 0.9)
+```
+
+## 농도 데이터 읽어들이기
+
+```{r}
+pm1 <- read.csv("daily2011-01-01.csv")
+pm1 <- na.omit(pm1)
+pm1 <- pm1[,-1]
+
+```
+
+### 좌표계 설정하기
+
+```{r}
+coordinates(pm1) <- ~LON+LAT
+proj4string(pm1) <- CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs") ### Set CRS
+UTM51N <- "+proj=utm +zone=51 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
+pm1 = spTransform(pm1, CRSobj = CRS(UTM51N))
+```
+
+
+## 크리깅 옵션1. Automap패키지 이용 
+
+
+```{r}
+library(automap)
+
+## Without new data model (for comparison) 
+kriging_result = autoKrige(PM25~1, pm1)
+kriging_result$sserr
+plot(kriging_result)
+
+## With new data model (main model)
+studyarea = spTransform(studyarea, CRSobj = CRS(UTM51N))
+kriging_result = autoKrige(pm25~1, pm1, studyarea)
+kriging_result$sserr
+plot(kriging_result)
+
+## With new data model (check error)
+stations <- pm1@coords
+stations <- SpatialPoints(stations)
+proj4string(stations) <- UTM51N
+kriging_result = autoKrige(pm25~1, pm1, stations)
+```
+
+
+
+############################# For loop ################################################
+studyarea = spTransform(studyarea, CRSobj = CRS(UTM51N))
+WGS84 <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
+UTM51N <- "+proj=utm +zone=51 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
+
+total <-35064
+
+for(i in 1:10){ #for sample
+  
+  pm <- read.csv(paste0("pm",i,".csv"))
+  pm <- na.omit(pm)
+  pm <- pm[,-1]
+  coordinates(pm) <- ~LON+LAT
+  proj4string(pm) <- CRS(WGS84) ### Set CRS
+  pm = spTransform(pm, CRSobj = CRS(UTM51N))
+
+  ## With new data model (main model)
+  kriging_result = autoKrige(pm25~1, pm, studyarea)
+
+  newdf <- cbind(kriging_result$krige_output@data$x, kriging_result$krige_output@data$y, kriging_result$krige_output@data[,-c(1:2)])
+  colnames(newdf)[c(1,2)] <- c("x","y")
+  coordinates(newdf) <- ~x+y
+  proj4string(newdf) <- CRS(UTM51N)
+  
+  #### Intersect spatial point within polygon map ######################################
+  st_newdf <- st_as_sf(newdf)
+  st_studyarea <- st_as_sf(studyarea)
+  st_newdf <- st_intersection(st_newdf, st_studyarea)
+  write.csv(st_newdf, file=paste0("kriged",i,".csv"))
+  rm(newdf, pm)
+}
+
+## 크리깅 옵션2. Kriging 패키지 이용하기
+
+
+```{r}
+library(maps)
+library(kriging)
+```
